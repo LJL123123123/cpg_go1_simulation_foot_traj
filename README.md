@@ -2,6 +2,21 @@
 
 [![DOI](https://img.shields.io/badge/DOI-10.48550/arXiv.2406.13419-blue)](https://doi.org/10.48550/arXiv.2406.13419)
 
+<img width="3315" height="1079" alt="image" src="https://github.com/user-attachments/assets/8c195982-b5cf-4f2d-b470-86d6564ab5b7" />
+
+## Citation
+
+If you use this work in your research, please cite:
+
+```bibtex
+@article{liu2024eight,
+  title={An eight-neuron network for quadruped locomotion with hip-knee joint control},
+  author={Liu, Yide and Liu, Xiyan and Wang, Dongqi and Yang, Wei and Qu, Shaoxing},
+  journal={The International Journal of Robotics Research},
+  pages={02783649251364286},
+  publisher={SAGE Publications Sage UK: London, England}
+}
+```
 A comprehensive simulation framework for quadruped robot locomotion based on Central Pattern Generator (CPG) networks and neural execution control for the Unitree Go1 robot.
 
 ## Overview
@@ -116,19 +131,6 @@ python examples/demo_video6_sensory_feedback_reflex.py
 ### 4. Backward Locomotion
 ```bash
 python examples/demo_video7_backward_control.py
-```
-
-## Citation
-
-If you use this work in your research, please cite:
-
-```bibtex
-@article{liu2024eight,
-  title={An eight-neuron network for quadruped locomotion with hip-knee joint control},
-  author={Liu, Yide and Liu, Xiyan and Wang, Dongqi and Yang, Wei and others},
-  journal={arXiv preprint arXiv:2406.13419},
-  year={2024}
-}
 ```
 
 ## License
