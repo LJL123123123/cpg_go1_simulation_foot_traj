@@ -40,6 +40,7 @@ class FootTrajectoryCPG(CPGBase):
         step_length: float = 0.15,  # 步长 (m)
         body_height: float = 0.25,  # 机身高度 (m)
         foot_spacing: float = 0.2,  # 足端间距 (m)
+        break_time: float = 0.05,  # 足端落地后的稳定时间 (s)
     ):
         super().__init__(before_ftype, after_ftype, total_time, toc)
         
@@ -50,6 +51,7 @@ class FootTrajectoryCPG(CPGBase):
         self.step_length = step_length  
         self.body_height = body_height
         self.foot_spacing = foot_spacing
+        self.break_time = break_time
         
         # 12个神经元: 4个足端 × 3个坐标  
         # 实际状态变量数量: 36 (12个x + 12个y + 12个z)
@@ -98,32 +100,50 @@ class FootTrajectoryCPG(CPGBase):
         }
 
     def get_foot_trajectory_params(self, ftype: int) -> Tuple[float, float, float]:
-        """获取足端轨迹生成参数 - 优化耦合约束"""
+        """获取足端轨迹生成参数 - 包含break时间的稳定性优化"""
+        
+        # 计算break时间对duty_factor的影响
+        # break时间在周期中的占比
         
         if ftype == 1:  # walk - 确保同时只有一个足端腾空
             frequency = 1.0    # 步频 (Hz)
-            duty_factor = 0.75 # 增加支撑相比例，确保足够的重叠时间
+            cycle_time = 1.0 / frequency
+            break_ratio = self.break_time / cycle_time
+            duty_factor = 0.75 + break_ratio  # 增加break时间到支撑相
             amplitude = 1.0    # 轨迹幅度系数
         elif ftype == 2:  # trot - 确保只有对角足端同时腾空
             frequency = 2.0
-            duty_factor = 0.5  # 50%支撑相，确保对角协调
+            cycle_time = 1.0 / frequency
+            break_ratio = self.break_time / cycle_time
+            duty_factor = 0.5 + break_ratio   # 增加break时间到支撑相
             amplitude = 1.2
         elif ftype == 3:  # pace
             frequency = 1.8
-            duty_factor = 0.5
+            cycle_time = 1.0 / frequency
+            break_ratio = self.break_time / cycle_time
+            duty_factor = 0.5 + break_ratio
             amplitude = 1.1
         elif ftype == 4:  # bound
             frequency = 2.5
-            duty_factor = 0.4
+            cycle_time = 1.0 / frequency
+            break_ratio = self.break_time / cycle_time
+            duty_factor = 0.4 + break_ratio
             amplitude = 1.5
         elif ftype == 5:  # pronk
             frequency = 3.0
-            duty_factor = 0.3
+            cycle_time = 1.0 / frequency
+            break_ratio = self.break_time / cycle_time
+            duty_factor = 0.3 + break_ratio
             amplitude = 2.0
         else:
             frequency = 1.0
-            duty_factor = 0.75
+            cycle_time = 1.0 / frequency
+            break_ratio = self.break_time / cycle_time
+            duty_factor = 0.75 + break_ratio
             amplitude = 1.0
+            
+        # 确保duty_factor不超过1.0
+        duty_factor = min(duty_factor, 0.95)
             
         return frequency, duty_factor, amplitude
 
@@ -305,15 +325,30 @@ class FootTrajectoryCPG(CPGBase):
             step_direction = 1.0
             
         if is_stance:
-            # 支撑相: 足端在地面滑动，从前向后
-            # 重新计算支撑相进度，确保平滑过渡
+            # 支撑相: 包含break时间和滑动阶段
             stance_progress = current_foot_phase['phase_ratio'] / self.duty_factor
             stance_progress = max(0.0, min(1.0, stance_progress))  # 限制在[0,1]
             
-            # 从步长的一半位置向后滑动到负一半位置
-            x_offset = self.step_length * step_direction * (0.5 - stance_progress)
-            y_offset = 0.0
-            z_offset = 0.0  # 保持在地面
+            # 计算break阶段在支撑相中的占比
+            cycle_time = 2 * np.pi / self.omega  # 一个完整周期的时间
+            stance_time = self.duty_factor * cycle_time  # 支撑相总时间
+            break_ratio_in_stance = self.break_time / stance_time  # break时间在支撑相中的占比
+            
+            if stance_progress <= break_ratio_in_stance:
+                # Break阶段: 足端保持静止，确保稳定
+                # 保持在着地瞬间的位置
+                x_offset = self.step_length * step_direction * 0.5  # 前端位置
+                y_offset = 0.0
+                z_offset = 0.0  # 稳定接触地面
+            else:
+                # 滑动阶段: 从前向后滑动
+                slide_progress = (stance_progress - break_ratio_in_stance) / (1.0 - break_ratio_in_stance)
+                slide_progress = max(0.0, min(1.0, slide_progress))
+                
+                # 从步长的一半位置向后滑动到负一半位置
+                x_offset = self.step_length * step_direction * (0.5 - slide_progress)
+                y_offset = 0.0
+                z_offset = 0.0  # 保持在地面
         else:
             # 摆动相: 足端抬起并向前摆动
             swing_progress = current_foot_phase['swing_progress']
