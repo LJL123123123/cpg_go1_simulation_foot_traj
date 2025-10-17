@@ -88,25 +88,25 @@ class FootTrajectoryCPG(CPGBase):
             "RH": np.array([-body_length/2, -body_width/2, -leg_length]) # 右后
         }
         
-        # 不同步态的相位差 (弧度) - 修正版本
+        # 不同步态的相位差 (弧度) - 增强耦合版本
         self.gait_phases = {
-            1: {"LF": 0, "RF": np.pi, "LH": np.pi/2, "RH": 3*np.pi/2},     # walk: 四拍步态
-            2: {"LF": 0, "RF": np.pi, "LH": np.pi, "RH": 0},               # trot: 对角步态
-            3: {"LF": 0, "RF": 0, "LH": np.pi, "RH": np.pi},               # pace: 同侧步态
-            4: {"LF": 0, "RF": 0, "LH": np.pi, "RH": np.pi},               # bound: 前后对称跳
+            1: {"LF": 0, "RF": np.pi/2, "LH": np.pi, "RH": 3*np.pi/2},     # walk: 严格四拍步态 (LF->RF->LH->RH)
+            2: {"LF": 0, "RF": np.pi, "LH": np.pi, "RH": 0},               # trot: 严格对角步态 (LF+RH, RF+LH)
+            3: {"LF": 0, "RF": 0, "LH": np.pi, "RH": np.pi},               # pace: 同侧步态 (LF+RF, LH+RH)
+            4: {"LF": 0, "RF": 0, "LH": np.pi, "RH": np.pi},               # bound: 前后对称跳 (前腿, 后腿)
             5: {"LF": 0, "RF": 0, "LH": 0, "RH": 0}                        # pronk: 四足同步跳
         }
 
     def get_foot_trajectory_params(self, ftype: int) -> Tuple[float, float, float]:
-        """获取足端轨迹生成参数"""
+        """获取足端轨迹生成参数 - 优化耦合约束"""
         
-        if ftype == 1:  # walk
+        if ftype == 1:  # walk - 确保同时只有一个足端腾空
             frequency = 1.0    # 步频 (Hz)
-            duty_factor = 0.6  # 支撑相比例
+            duty_factor = 0.75 # 增加支撑相比例，确保足够的重叠时间
             amplitude = 1.0    # 轨迹幅度系数
-        elif ftype == 2:  # trot  
+        elif ftype == 2:  # trot - 确保只有对角足端同时腾空
             frequency = 2.0
-            duty_factor = 0.5
+            duty_factor = 0.5  # 50%支撑相，确保对角协调
             amplitude = 1.2
         elif ftype == 3:  # pace
             frequency = 1.8
@@ -122,7 +122,7 @@ class FootTrajectoryCPG(CPGBase):
             amplitude = 2.0
         else:
             frequency = 1.0
-            duty_factor = 0.6
+            duty_factor = 0.75
             amplitude = 1.0
             
         return frequency, duty_factor, amplitude
@@ -189,9 +189,92 @@ class FootTrajectoryCPG(CPGBase):
         else:
             self.strategy = 1  # 简单切换策略 (可以后续扩展)
             
+    def get_all_foot_phases(self, t: float) -> dict:
+        """
+        获取所有足端在当前时刻的相位信息
+        
+        Returns:
+            dict: 包含每个足端的相位比例和是否在支撑相的信息
+        """
+        foot_phases = {}
+        
+        for foot_name in self.foot_names:
+            gait_phase = self.gait_phases[self.before_ftype][foot_name]
+            total_phase = self.omega * t + gait_phase
+            normalized_phase = total_phase % (2 * np.pi)
+            phase_ratio = normalized_phase / (2 * np.pi)
+            is_stance = phase_ratio < self.duty_factor
+            
+            foot_phases[foot_name] = {
+                'phase_ratio': phase_ratio,
+                'is_stance': is_stance,
+                'swing_progress': 0.0 if is_stance else (phase_ratio - self.duty_factor) / (1 - self.duty_factor)
+            }
+        
+        return foot_phases
+    
+    def enforce_gait_constraints(self, foot_phases: dict, foot_name: str) -> dict:
+        """
+        强制执行步态约束条件
+        
+        Args:
+            foot_phases: 所有足端的相位信息
+            foot_name: 当前足端名称
+            
+        Returns:
+            修正后的相位信息
+        """
+        
+        # 获取当前步态的约束条件
+        if self.before_ftype == 1:  # Walk步态: 同时只能有一个足端腾空
+            # 统计当前腾空的足端
+            airborne_feet = [name for name, info in foot_phases.items() if not info['is_stance']]
+            
+            if len(airborne_feet) > 1:
+                # 如果有多个足端腾空，保留相位最靠前的一个
+                primary_foot = min(airborne_feet, key=lambda x: foot_phases[x]['swing_progress'])
+                
+                # 强制其他足端回到支撑相
+                for foot in airborne_feet:
+                    if foot != primary_foot:
+                        foot_phases[foot]['is_stance'] = True
+                        foot_phases[foot]['swing_progress'] = 0.0
+                        
+        elif self.before_ftype == 2:  # Trot步态: 只有对角足端能同时腾空
+            # 定义对角关系
+            diagonal_pairs = [("LF", "RH"), ("RF", "LH")]
+            
+            airborne_feet = [name for name, info in foot_phases.items() if not info['is_stance']]
+            
+            if len(airborne_feet) > 2:
+                # 如果超过2个足端腾空，保留一个对角对
+                for pair in diagonal_pairs:
+                    if pair[0] in airborne_feet and pair[1] in airborne_feet:
+                        # 保留这个对角对，强制其他足端着地
+                        keep_feet = set(pair)
+                        for foot in airborne_feet:
+                            if foot not in keep_feet:
+                                foot_phases[foot]['is_stance'] = True
+                                foot_phases[foot]['swing_progress'] = 0.0
+                        break
+                        
+            elif len(airborne_feet) == 1:
+                # 如果只有一个足端腾空，检查是否应该让对角足端也腾空
+                single_foot = airborne_feet[0]
+                for pair in diagonal_pairs:
+                    if single_foot in pair:
+                        diagonal_foot = pair[1] if pair[0] == single_foot else pair[0]
+                        # 根据相位差判断对角足端是否也应该腾空
+                        if abs(foot_phases[single_foot]['swing_progress'] - 
+                               foot_phases[diagonal_foot]['swing_progress']) < 0.3:
+                            foot_phases[diagonal_foot]['is_stance'] = False
+                        break
+        
+        return foot_phases
+    
     def generate_foot_position(self, foot_name: str, t: float, phase_offset: float = 0) -> np.ndarray:
         """
-        生成单个足端的期望轨迹 - 修正版本
+        生成单个足端的期望轨迹 - 增强耦合约束版本
         
         Args:
             foot_name: 足端名称 ("LF", "RF", "LH", "RH")
@@ -205,16 +288,15 @@ class FootTrajectoryCPG(CPGBase):
         # 获取基础位置 (足端的名义接触位置)
         base_pos = self.foot_base_positions[foot_name].copy()
         
-        # 计算步态相位
-        gait_phase = self.gait_phases[self.before_ftype][foot_name]
-        total_phase = self.omega * t + gait_phase + phase_offset
+        # 获取所有足端的相位信息
+        foot_phases = self.get_all_foot_phases(t)
         
-        # 归一化相位到[0, 2π]
-        normalized_phase = total_phase % (2 * np.pi)
-        phase_ratio = normalized_phase / (2 * np.pi)
+        # 应用步态约束
+        foot_phases = self.enforce_gait_constraints(foot_phases, foot_name)
         
-        # 判断是否在支撑相或摆动相
-        is_stance = phase_ratio < self.duty_factor
+        # 获取当前足端的修正后相位信息
+        current_foot_phase = foot_phases[foot_name]
+        is_stance = current_foot_phase['is_stance']
         
         # 步态方向
         if self._if_backward:
@@ -224,14 +306,18 @@ class FootTrajectoryCPG(CPGBase):
             
         if is_stance:
             # 支撑相: 足端在地面滑动，从前向后
-            stance_progress = phase_ratio / self.duty_factor  # 0 to 1
+            # 重新计算支撑相进度，确保平滑过渡
+            stance_progress = current_foot_phase['phase_ratio'] / self.duty_factor
+            stance_progress = max(0.0, min(1.0, stance_progress))  # 限制在[0,1]
+            
             # 从步长的一半位置向后滑动到负一半位置
             x_offset = self.step_length * step_direction * (0.5 - stance_progress)
             y_offset = 0.0
             z_offset = 0.0  # 保持在地面
         else:
             # 摆动相: 足端抬起并向前摆动
-            swing_progress = (phase_ratio - self.duty_factor) / (1 - self.duty_factor)  # 0 to 1
+            swing_progress = current_foot_phase['swing_progress']
+            swing_progress = max(0.0, min(1.0, swing_progress))  # 限制在[0,1]
             
             # X方向: 椭圆轨迹的水平分量，从后向前
             x_offset = self.step_length * step_direction * (swing_progress - 0.5)
