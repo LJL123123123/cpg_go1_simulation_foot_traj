@@ -74,6 +74,14 @@ class FootTrajectoryCPG(CPGBase):
         # 足端轨迹记录
         self.foot_trajectories = {foot: [] for foot in self.foot_names}
         
+    # IMU / 传感器反馈状态（用于地形/坡度自适应）
+    # pitch/roll 单位为弧度，accel 为长度 3 的加速度向量 (m/s^2)
+    self.imu_pitch = 0.0
+    self.imu_roll = 0.0
+    self.imu_accel = np.zeros(3)
+    # 低通滤波系数，用于平滑 IMU 数据（0..1），较小更平滑
+    self.imu_filter_alpha = 0.2
+        
     def _init_foot_trajectory_params(self):
         """初始化足端轨迹生成参数"""
         
@@ -307,6 +315,36 @@ class FootTrajectoryCPG(CPGBase):
         
         # 获取基础位置 (足端的名义接触位置)
         base_pos = self.foot_base_positions[foot_name].copy()
+
+        # ----- 使用 IMU 反馈对轨迹进行轻微调节（坡度/不平地面自适应） -----
+        # 这个调整是保守的：只改变步长和抬腿高度的比例，以及基座偏移，
+        # 避免直接破坏步态。你可以根据需求把调节强度调大。
+        pitch = self.imu_pitch
+        roll = self.imu_roll
+
+        # 映射规则示例：
+        #  - 当机体向上抬头（pitch>0）表示爬坡：增大后腿步长，减小前腿步长，抬腿高度略增
+        #  - 当机体向下（pitch<0）表示下坡：相反处理
+        pitch_gain = 0.5  # 灵敏度（可调）
+        # 限制 pitch 的影响范围，避免过度放大
+        pitch_clip = max(-0.5, min(0.5, pitch))
+
+        # 基于脚位（前/后）分配不同的步长倍率
+        if foot_name in ("LF", "RF"):  # 前脚
+            local_step_length = self.step_length * (1.0 - pitch_gain * pitch_clip)
+        else:  # 后脚
+            local_step_length = self.step_length * (1.0 + pitch_gain * pitch_clip)
+
+        # 抬腿高度随坡度增加（绝对值），但限制范围
+        height_gain = 1.0
+        local_step_height = self.step_height * (1.0 + height_gain * min(0.8, abs(pitch_clip)))
+
+        # 小的横向补偿（基于 roll），使机器人在侧倾时稍微调整足位以稳定
+        roll_gain = 0.03
+        lateral_comp = roll_gain * roll
+        base_pos[1] += lateral_comp
+
+        # 在后续计算中使用 local_step_length/local_step_height 替代 self.step_length/self.step_height
         
         # 获取所有足端的相位信息
         foot_phases = self.get_all_foot_phases(t)
@@ -337,7 +375,7 @@ class FootTrajectoryCPG(CPGBase):
             if stance_progress <= break_ratio_in_stance:
                 # Break阶段: 足端保持静止，确保稳定
                 # 保持在着地瞬间的位置
-                x_offset = self.step_length * step_direction * 0.5  # 前端位置
+                x_offset = local_step_length * step_direction * 0.5  # 前端位置
                 y_offset = 0.0
                 z_offset = 0.0  # 稳定接触地面
             else:
@@ -346,7 +384,7 @@ class FootTrajectoryCPG(CPGBase):
                 slide_progress = max(0.0, min(1.0, slide_progress))
                 
                 # 从步长的一半位置向后滑动到负一半位置
-                x_offset = self.step_length * step_direction * (0.5 - slide_progress)
+                x_offset = local_step_length * step_direction * (0.5 - slide_progress)
                 y_offset = 0.0
                 z_offset = 0.0  # 保持在地面
         else:
@@ -355,14 +393,14 @@ class FootTrajectoryCPG(CPGBase):
             swing_progress = max(0.0, min(1.0, swing_progress))  # 限制在[0,1]
             
             # X方向: 椭圆轨迹的水平分量，从后向前
-            x_offset = self.step_length * step_direction * (swing_progress - 0.5)
+            x_offset = local_step_length * step_direction * (swing_progress - 0.5)
             
             # Y方向: 保持不变
             y_offset = 0.0
             
             # Z方向: 椭圆轨迹的垂直分量，形成抛物线抬腿
             # 使用正弦函数创建平滑的抬腿轨迹
-            z_offset = self.step_height * np.sin(np.pi * swing_progress)
+            z_offset = local_step_height * np.sin(np.pi * swing_progress)
             
         # 计算最终足端位置
         foot_position = base_pos + np.array([x_offset, y_offset, z_offset])
@@ -416,6 +454,31 @@ class FootTrajectoryCPG(CPGBase):
         dzdt = (y - z) * 5.0   # z跟踪更早的历史
         
         return np.hstack([dxdt, dydt, dzdt])
+
+    def set_imu_feedback(self, pitch: float, roll: float, accel: Optional[np.ndarray] = None, alpha: Optional[float] = None) -> None:
+        """
+        给 CPG 注入 IMU 反馈。
+
+        Args:
+            pitch (float): 机体俯仰角，弧度（正为机头上抬）
+            roll (float): 横滚角，弧度（正为向右侧倾）
+            accel (np.ndarray|None): 三维加速度向量 (m/s^2)，可选
+            alpha (float|None): 可选的低通滤波系数，范围 (0..1)。提供后会覆盖默认滤波系数。
+
+        说明: 本方法会对输入做一阶低通滤波并更新内部 imu_* 状态。
+        """
+        if alpha is None:
+            alpha = self.imu_filter_alpha
+
+        # 简单一阶低通滤波
+        self.imu_pitch = alpha * pitch + (1.0 - alpha) * self.imu_pitch
+        self.imu_roll = alpha * roll + (1.0 - alpha) * self.imu_roll
+        if accel is not None:
+            try:
+                self.imu_accel = alpha * np.asarray(accel) + (1.0 - alpha) * self.imu_accel
+            except Exception:
+                # ignore bad accel
+                pass
 
     def get_output_path(self) -> Path:
         """获取输出文件路径"""
