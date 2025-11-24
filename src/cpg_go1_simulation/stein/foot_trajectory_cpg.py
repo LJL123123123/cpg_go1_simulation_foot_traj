@@ -73,14 +73,15 @@ class FootTrajectoryCPG(CPGBase):
         
         # 足端轨迹记录
         self.foot_trajectories = {foot: [] for foot in self.foot_names}
+        # IMU / 传感器反馈状态（用于地形/坡度自适应）
+        # pitch/roll 单位为弧度，accel 为长度 3 的加速度向量 (m/s^2)
+        self.imu_pitch = 0.0
+        self.imu_roll = 0.0
+        self.imu_accel = np.zeros(3)
+        # 低通滤波系数，用于平滑 IMU 数据（0..1），较小更平滑
+        self.imu_filter_alpha = 0.2
         
-    # IMU / 传感器反馈状态（用于地形/坡度自适应）
-    # pitch/roll 单位为弧度，accel 为长度 3 的加速度向量 (m/s^2)
-    self.imu_pitch = 0.0
-    self.imu_roll = 0.0
-    self.imu_accel = np.zeros(3)
-    # 低通滤波系数，用于平滑 IMU 数据（0..1），较小更平滑
-    self.imu_filter_alpha = 0.2
+    
         
     def _init_foot_trajectory_params(self):
         """初始化足端轨迹生成参数"""
@@ -153,14 +154,14 @@ class FootTrajectoryCPG(CPGBase):
         # 确保duty_factor不超过1.0
         duty_factor = min(duty_factor, 0.95)
             
-        return frequency, duty_factor, amplitude
+        return frequency, duty_factor, amplitude, break_ratio
 
     def set_neuron_params(self, ftype: int) -> None:
         """设置神经元参数"""
         super().set_neuron_params(ftype)
         
         # 获取足端轨迹参数
-        self.frequency, self.duty_factor, self.amplitude = self.get_foot_trajectory_params(ftype)
+        self.frequency, self.duty_factor, self.amplitude, self.break_ratio = self.get_foot_trajectory_params(ftype)
         
         # 轨迹生成参数
         self.omega = 2 * np.pi * self.frequency  # 角频率
@@ -232,10 +233,12 @@ class FootTrajectoryCPG(CPGBase):
             normalized_phase = total_phase % (2 * np.pi)
             phase_ratio = normalized_phase / (2 * np.pi)
             is_stance = phase_ratio < self.duty_factor
+            readyswim = phase_ratio < (self.duty_factor - self.break_ratio)
             
             foot_phases[foot_name] = {
                 'phase_ratio': phase_ratio,
                 'is_stance': is_stance,
+                'readyswim': readyswim,
                 'swing_progress': 0.0 if is_stance else (phase_ratio - self.duty_factor) / (1 - self.duty_factor)
             }
         
